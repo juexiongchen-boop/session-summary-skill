@@ -22,6 +22,13 @@ import unicodedata
 from datetime import datetime
 from pathlib import Path
 
+# Windows defaults to GBK for stdout/stderr; we emit emojis (📇) and
+# box-drawing chars (╔═╗) that GBK can't encode. Force UTF-8.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 MIN_USER_MESSAGES = int(os.environ.get("DAILY_SUMMARY_MIN_MSG", "5"))
 DEDUP_SECS = int(os.environ.get("DAILY_SUMMARY_DEDUP_SECS", "180"))  # 3 min
 LOCK_STALE_SECS = int(os.environ.get("DAILY_SUMMARY_LOCK_STALE_SECS", "600"))  # 10 min
@@ -165,26 +172,33 @@ def trim_segments(segments, max_turns=30, max_total_chars=12000):
 
 
 def run_claude_summarize(conv_file: Path) -> str:
+    # Single-line prompt: cmd.exe /c treats \n as a command separator, so
+    # multi-line prompts get truncated to the first line on Windows. Keep
+    # this prompt on one line — `claude -p` understands it fine.
     prompt = (
         f"你是对话总结助手。请阅读文件 {conv_file} 中的对话内容 "
-        f"（每段以 [user] 或 [assistant] 开头）。\n\n"
-        "请严格按以下格式输出（不要任何额外说明、开场白、结束语、代码块包裹）：\n\n"
-        "<<<TITLE:::\n"
-        "<一句话中文标题，不超过20字，简洁有力>\n"
-        "<<<SUMMARY:::\n"
-        "<3-5句中文摘要，概括对话核心内容与结论>\n"
-        "<<<DECISIONS:::\n"
-        "- 决策/待办1\n"
-        "- 决策/待办2\n"
-        "- 决策/待办3\n"
-        "（如对话中无明确决策/待办，这一节写「无」）\n"
-        "<<<END:::"
+        f"（每段以 [user] 或 [assistant] 开头）。 "
+        f"请严格按以下格式输出（不要任何额外说明、开场白、结束语、代码块包裹）: "
+        f"<<<TITLE::: <一句话中文标题，不超过20字，简洁有力> "
+        f"<<<SUMMARY::: <3-5句中文摘要，概括对话核心内容与结论> "
+        f"<<<DECISIONS::: - 决策/待办1 - 决策/待办2 - 决策/待办3 "
+        f"（如对话中无明确决策/待办，这一节写「无」） "
+        f"<<<END:::"
     )
     try:
+        if os.name == "nt":
+            # Windows: npm-installed `claude` is a .cmd shim; Python's
+            # CreateProcess doesn't resolve .cmd via PATHEXT, so route
+            # through cmd.exe. subprocess.list2cmdline handles quoting.
+            cmd = ["cmd.exe", "/c", "claude", "-p", prompt]
+        else:
+            cmd = ["claude", "-p", prompt]
         result = subprocess.run(
-            ["claude", "-p", prompt],
+            cmd,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=110,
         )
         return (result.stdout or "").strip()

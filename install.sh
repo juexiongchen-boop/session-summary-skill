@@ -30,7 +30,14 @@ from pathlib import Path
 
 # Marker commands the installer writes into settings.json. The canonical form
 # uses ~/.claude/scripts/... so that the path is portable across machines.
-HOOK_COMMAND = "python3 ~/.claude/scripts/daily-summary.py"
+# Windows doesn't ship `python3` (only `python`); also `~/.claude/...` works
+# in bash but not cmd.exe, so on Windows we use the absolute path explicitly.
+if os.name == "nt":
+    HOOK_COMMAND = (
+        f'python "{Path.home() / ".claude" / "scripts" / "daily-summary.py"}"'
+    )
+else:
+    HOOK_COMMAND = "python3 ~/.claude/scripts/daily-summary.py"
 HOOK_TIMEOUT = 120
 
 # CLAUDE.md marker block — must match the BEGIN/END strings that
@@ -163,14 +170,18 @@ def install_scripts(home: Path, skill_dir: Path, dry_run: bool) -> list[str]:
 
 # ---- Memory dir init --------------------------------------------------------
 
-def ensure_memory_dir(home: Path, cwd_name: str, dry_run: bool) -> list[str]:
-    """Create ~/.claude/projects/-<cwd_name>/memory/ if missing.
-    Note: cwd_name comes from the installer's CWD (project name), which is
-    typically 'root' for the home project."""
+def ensure_memory_dir(home: Path, project_name: str, dry_run: bool) -> list[str]:
+    """Create ~/.claude/projects/-<project_name>/memory/ if missing.
+
+    We always use `root` (the script's hardcoded default) regardless of the
+    installer's cwd, because daily-summary.py writes to ~/.claude/projects/-root/memory.
+    Mismatched names create orphan directories.
+    """
     notes = []
-    mem_dir = home / ".claude" / "projects" / f"-{cwd_name}" / "memory"
+    project_name = "root"  # align with daily-summary.py: MEMORY_DIR
+    mem_dir = home / ".claude" / "projects" / f"-{project_name}" / "memory"
     if mem_dir.is_dir():
-        notes.append(f"  memory/{cwd_name}: already exists")
+        notes.append(f"  memory/{project_name}: already exists")
         return notes
     if not dry_run:
         mem_dir.mkdir(parents=True, exist_ok=True)
@@ -178,7 +189,7 @@ def ensure_memory_dir(home: Path, cwd_name: str, dry_run: bool) -> list[str]:
         idx = mem_dir / "MEMORY.md"
         if not idx.is_file():
             idx.write_text("", encoding="utf-8")
-    notes.append(f"  memory/{cwd_name}: created (seeded empty MEMORY.md)")
+    notes.append(f"  memory/{project_name}: created (seeded empty MEMORY.md)")
     return notes
 
 
@@ -207,7 +218,7 @@ def main() -> int:
     print(f"=== Installing session-summary-card v2 ===")
     print(f"  home:    {home}")
     print(f"  skill:   {skill_dir}")
-    print(f"  project: {cwd_name}")
+    print(f"  project: root (aligned with daily-summary.py default)")
     if args.dry_run:
         print(f"  mode:    DRY RUN")
     print()
