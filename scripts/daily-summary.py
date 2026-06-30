@@ -30,19 +30,24 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 MIN_USER_MESSAGES = int(os.environ.get("DAILY_SUMMARY_MIN_MSG", "5"))
-DEDUP_SECS = int(os.environ.get("DAILY_SUMMARY_DEDUP_SECS", "180"))  # 3 min
+DEDUP_SECS = int(os.environ.get("DAILY_SUMMARY_DEDUP_SECS", "60"))  # 1 min (was 180)
 LOCK_STALE_SECS = int(os.environ.get("DAILY_SUMMARY_LOCK_STALE_SECS", "600"))  # 10 min
+ERROR_DEDUP_SECS = int(os.environ.get("DAILY_SUMMARY_ERROR_DEDUP_SECS", "60"))
 CARD_INNER_WIDTH = 44
 SUMMARY_DIR = Path(os.environ.get("DAILY_SUMMARY_DIR", str(Path.home() / "daily-summaries")))
 LOCK_PATH = SUMMARY_DIR / ".summary.lock"
+ERROR_LOCK_PATH = SUMMARY_DIR / ".error.lock"
 
 
-def _latest_summary_mtime() -> float | None:
-    """Return the mtime of the newest .md in SUMMARY_DIR, or None if empty."""
+def _latest_mtime(pattern: str = "*.md") -> float | None:
+    """Return the mtime of the newest file matching `pattern` in SUMMARY_DIR,
+    or None if the dir is empty / doesn't exist. Used for the summary-mode
+    dedup window (`*.md`) and the error-mode dedup window (`ERROR-*.md`).
+    """
     if not SUMMARY_DIR.exists():
         return None
     newest: float | None = None
-    for p in SUMMARY_DIR.glob("*.md"):
+    for p in SUMMARY_DIR.glob(pattern):
         try:
             m = p.stat().st_mtime
         except OSError:
@@ -52,8 +57,8 @@ def _latest_summary_mtime() -> float | None:
     return newest
 
 
-def _try_acquire_lock() -> bool:
-    """Atomically acquire SUMMARY_DIR/.summary.lock.
+def _try_acquire_lock(lock_path: Path = LOCK_PATH) -> bool:
+    """Atomically acquire the named lock file (default: SUMMARY_DIR/.summary.lock).
 
     Returns True if this process holds the lock; False if another process
     holds a fresh lock (in which case we should exit immediately).
@@ -63,15 +68,15 @@ def _try_acquire_lock() -> bool:
     much larger than the longest expected claude -p call, otherwise a slow
     but legitimate run would lose its lock to a racing process.
     """
-    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Break stale locks (crash leftovers)
-    if LOCK_PATH.exists():
+    if lock_path.exists():
         try:
-            age = time.time() - LOCK_PATH.stat().st_mtime
+            age = time.time() - lock_path.stat().st_mtime
             if age > LOCK_STALE_SECS:
                 try:
-                    LOCK_PATH.unlink()
+                    lock_path.unlink()
                 except OSError:
                     pass
         except OSError:
@@ -79,7 +84,7 @@ def _try_acquire_lock() -> bool:
 
     # Atomic exclusive create — O_EXCL is the critical bit
     try:
-        fd = os.open(str(LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         try:
             os.write(fd, f"pid={os.getpid()} ts={time.time():.0f}\n".encode())
         finally:
@@ -88,14 +93,14 @@ def _try_acquire_lock() -> bool:
     except FileExistsError:
         return False
     except OSError as e:
-        print(f"[daily-summary] lock acquire failed: {e}", file=sys.stderr)
+        print(f"[daily-summary] lock acquire failed ({lock_path}): {e}", file=sys.stderr)
         return False
 
 
-def _release_lock() -> None:
+def _release_lock(lock_path: Path = LOCK_PATH) -> None:
     """Best-effort lock release. Safe to call even if we don't own the lock."""
     try:
-        LOCK_PATH.unlink()
+        lock_path.unlink()
     except OSError:
         pass
 
@@ -515,10 +520,343 @@ def _set_claude_md_pointer() -> None:
     CLAUDE_MD_PATH.write_text(new_existing, encoding="utf-8")
 
 
+# ── v3: Tree format & error-mode path ──────────────────────────────────────
+
+# Secret redaction patterns for tool_input dumps. We never want to leak
+# API keys, tokens, or passwords into summary files. Patterns are matched
+# case-insensitively against tool_input values.
+_SECRET_PATTERNS = [
+    # api_key=foo / token: bar / password="baz" / secret=baz
+    (re.compile(r'(?i)\b(api[_-]?key|access[_-]?token|token|password|passwd|secret)\b\s*[:=]\s*["\']?[\w.\-]+'), r'\1=<REDACTED>'),
+    # Anthropic-style: sk-ant-...
+    (re.compile(r'sk-ant-[A-Za-z0-9_\-]{8,}'), 'sk-ant-<REDACTED>'),
+    # OpenAI-style: sk-... (20+ chars)
+    (re.compile(r'(?<![A-Za-z0-9])sk-[A-Za-z0-9]{20,}'), 'sk-<REDACTED>'),
+    # GitHub PATs: ghp_ / gho_ / ghu_ / ghs_ / ghr_
+    (re.compile(r'\b(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}'), r'\1_<REDACTED>'),
+    # Bearer tokens in Authorization headers
+    (re.compile(r'(?i)(Bearer\s+)[A-Za-z0-9._\-]+'), r'\1<REDACTED>'),
+]
+
+
+def redact_secrets(s: str) -> str:
+    """Mask common secret patterns in tool_input strings."""
+    if not s:
+        return s
+    for pattern, replacement in _SECRET_PATTERNS:
+        s = pattern.sub(replacement, s)
+    return s
+
+
+def curate_tool_input(tool_name: str, tool_input) -> str:
+    """Return a curated, secret-redacted one-liner describing the tool_input.
+    Avoid dumping the whole dict to keep cards compact and avoid leaks."""
+    if tool_input is None:
+        return ""
+    if isinstance(tool_input, str):
+        return redact_secrets(tool_input)[:200]
+    if not isinstance(tool_input, dict):
+        return redact_secrets(str(tool_input))[:200]
+
+    # Per-tool curated fields
+    if tool_name == "Bash":
+        cmd = tool_input.get("command", "")
+        desc = tool_input.get("description", "")
+        line = redact_secrets(cmd)[:200]
+        if desc:
+            line = f"{line}  # {desc[:60]}" if line else desc[:200]
+        return line
+    if tool_name in ("Read", "Write", "Edit", "MultiEdit"):
+        return tool_input.get("file_path", "")
+    if tool_name == "Grep":
+        return f"pattern={tool_input.get('pattern', '')!r}  path={tool_input.get('path', '')}"
+    if tool_name == "Glob":
+        return f"pattern={tool_input.get('pattern', '')!r}  path={tool_input.get('path', '')}"
+    if tool_name in ("Agent", "Task"):
+        return f"prompt={tool_input.get('prompt', tool_input.get('description', ''))!r:.200}"
+    if tool_name == "WebFetch":
+        return tool_input.get("url", "")
+    if tool_name == "WebSearch":
+        return tool_input.get("query", "")
+    # Fallback: show only the first short string field
+    for k, v in tool_input.items():
+        if isinstance(v, str) and v:
+            return f"{k}={redact_secrets(v)[:200]!r}"
+    return f"<{tool_name} args>"
+
+
+def build_error_ans(tool_name: str, tool_input_str: str, exit_code, stderr: str,
+                     duration_ms, ts_human: str, fname: str) -> str:
+    """Build a red-themed colored .ans card for a tool error."""
+    inner = CARD_INNER_WIDTH
+    b = "1;31"  # bold red border for errors
+
+    top = c(b, "╔" + "═" * (inner + 2) + "╗")
+    sep = c(b, "╠" + "═" * (inner + 2) + "╣")
+    bot = c(b, "╚" + "═" * (inner + 2) + "╝")
+
+    def line(content, clr="38;5;252"):
+        padded = pad(content, inner)
+        return c(b, "║") + " " + c(clr, padded) + " " + c(b, "║")
+
+    def empty():
+        return c(b, "║") + " " + (" " * inner) + " " + c(b, "║")
+
+    lines = [
+        line(f"{c('38;5;203', '✗')} {ts_human}", "2;31"),  # dim red
+        sep,
+    ]
+
+    # Title
+    title = f"{c('38;5;203', '✗')} {tool_name} failed"
+    if exit_code is not None:
+        title += f" (exit {exit_code})"
+    lines.append(line(clip_to_width(title, inner), "1;38;2;255;180;180"))
+    lines.append(empty())
+
+    # Input line
+    if tool_input_str:
+        lines.append(line(clip_to_width(tool_input_str, inner), "38;5;252"))
+        lines.append(empty())
+
+    # Stderr block (capped)
+    if stderr.strip():
+        stderr_lines = [l for l in stderr.strip().split("\n") if l.strip()][:3]
+        lines.append(line(f"{c('1;33', '▰ stderr')} {c('1;33', f'({len(stderr_lines)})')}", "1;33"))
+        for sl in stderr_lines:
+            lines.append(line(clip_to_width(sl, inner), "38;5;210"))
+        lines.append(empty())
+
+    # Duration
+    if duration_ms is not None:
+        lines.append(line(f"duration: {duration_ms} ms", "2;37"))
+
+    # File pointer
+    fpath = fname if visible_width(fname) <= inner - 4 else clip_to_width(fname, inner - 4)
+    lines.append(line(f"{c(CLR_FILE, '➜')} {fpath}"))
+    lines.append(bot)
+    return "\n".join(lines) + RESET
+
+
+def build_error_tree(tool_name: str, tool_input_str: str, exit_code, stderr: str,
+                      duration_ms, ts_human: str, short_sid: str, fname: str) -> str:
+    """Plain-ASCII tree diagram for a tool error. No ANSI, any terminal."""
+    lines = [f"session {short_sid} — tool error ─ {ts_human}"]
+    lines.append(f"├─ tool: {tool_name}")
+
+    if tool_input_str:
+        lines.append(f"│  └─ input: {tool_input_str}")
+
+    if exit_code is not None:
+        lines.append(f"├─ exit_code: {exit_code}")
+
+    if stderr.strip():
+        stderr_lines = [l for l in stderr.strip().split("\n") if l.strip()][:5]
+        lines.append(f"├─ stderr ({len(stderr_lines)} line{'s' if len(stderr_lines) != 1 else ''}):")
+        for i, sl in enumerate(stderr_lines):
+            connector = "│  ├─" if i < len(stderr_lines) - 1 else "│  └─"
+            lines.append(f"{connector} {sl[:200]}")
+
+    if duration_ms is not None:
+        lines.append(f"├─ duration_ms: {duration_ms}")
+
+    lines.append(f"└─ ➜ {fname}")
+    return "\n".join(lines) + "\n"
+
+
+def build_tree_card(
+    title: str,
+    summary: str,
+    decisions: list[str],
+    outfile: Path,
+    ts_human: str,
+    short_sid: str,
+    mode: str = "summary",
+) -> str:
+    """Plain-ASCII tree diagram of a session summary. Mirrors build_card()
+    but uses ├─ │ └─ instead of colored borders. Readable in any terminal
+    without ANSI support; easy to grep / diff."""
+    label = "auto-summary" if mode == "summary" else "summary"
+    lines = [f"session {short_sid} — {label} ─ {ts_human}"]
+    lines.append(f"├─ 主题: {title}")
+
+    # Summary block (multiline-aware)
+    summary_text = (summary or "").strip()
+    if summary_text:
+        sum_lines = [l for l in summary_text.split("\n") if l.strip()][:5]
+        if len(sum_lines) == 1:
+            lines.append(f"├─ 摘要: {sum_lines[0]}")
+        else:
+            lines.append("├─ 摘要:")
+            for i, sl in enumerate(sum_lines):
+                connector = "│  ├─" if i < len(sum_lines) - 1 else "│  └─"
+                lines.append(f"{connector} {sl[:200]}")
+    else:
+        lines.append("├─ 摘要: (无)")
+
+    # Decisions
+    if decisions and decisions != ["无"]:
+        n = min(len(decisions), 8)
+        lines.append(f"├─ 决策 / 待办 ({n}):")
+        for i, d in enumerate(decisions[:n]):
+            connector = "│  ├─" if i < n - 1 else "│  └─"
+            lines.append(f"{connector} {d[:200]}")
+    else:
+        lines.append("├─ 决策 / 待办: 无")
+
+    # File pointer (last leaf)
+    fname = outfile.name
+    lines.append(f"└─ ➜ {fname}")
+    return "\n".join(lines) + "\n"
+
+
+def _handle_error_mode(hook_input: dict, sid: str) -> int:
+    """Handle a PostToolUseFailure event. Generate a structured error card
+    WITHOUT calling claude -p (errors are structured data — no LLM needed).
+
+    Uses a separate .error.lock and ERROR_DEDUP_SECS window so errors don't
+    block summary generation and vice versa.
+    """
+    SUMMARY_DIR.mkdir(parents=True, exist_ok=True)
+    if not _try_acquire_lock(ERROR_LOCK_PATH):
+        return 0
+    try:
+        latest = _latest_mtime("ERROR-*.md")
+        if latest is not None and (time.time() - latest) < ERROR_DEDUP_SECS:
+            return 0
+
+        tool_name = hook_input.get("tool_name", "unknown")
+        tool_input = hook_input.get("tool_input")
+        tool_response = hook_input.get("tool_response") or {}
+        duration_ms = hook_input.get("duration_ms")
+
+        # Curate tool_input — show only safe fields, redact secrets
+        tool_input_str = curate_tool_input(tool_name, tool_input)
+        exit_code = tool_response.get("exitCode")
+        stderr = tool_response.get("stderr", "") or ""
+        stdout = tool_response.get("stdout", "") or ""
+
+        ts = datetime.now().strftime("%Y-%m-%d-%H%M%S")
+        ts_human = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        short_sid = sid[:8] if sid else "unknown"
+        outfile = SUMMARY_DIR / f"ERROR-{ts}-{short_sid}.md"
+
+        # --- .md (structured, human-readable) ---
+        md_lines = [
+            f"# Tool Error: {tool_name}",
+            "",
+            f"**时间**: {ts_human}  ",
+            f"**Session ID**: `{short_sid}`  ",
+            f"**Tool**: `{tool_name}`  ",
+        ]
+        if exit_code is not None:
+            md_lines.append(f"**Exit Code**: `{exit_code}`  ")
+        if duration_ms is not None:
+            md_lines.append(f"**Duration**: `{duration_ms}` ms")
+        md_lines.append("")
+
+        if tool_input_str:
+            md_lines.append("## Input (curated, secrets redacted)")
+            md_lines.append("")
+            md_lines.append("```")
+            md_lines.append(tool_input_str)
+            md_lines.append("```")
+            md_lines.append("")
+
+        if stderr.strip():
+            md_lines.append("## Stderr")
+            md_lines.append("")
+            md_lines.append("```")
+            md_lines.append(stderr.rstrip()[:2000])  # cap at 2KB
+            md_lines.append("```")
+            md_lines.append("")
+
+        if stdout.strip() and exit_code:
+            # Only include stdout if there was a failure — sometimes useful
+            md_lines.append("## Stdout (tail, last 1KB)")
+            md_lines.append("")
+            md_lines.append("```")
+            md_lines.append(stdout[-1000:].rstrip())
+            md_lines.append("```")
+            md_lines.append("")
+
+        md_lines.append("---")
+        md_lines.append("")
+        md_lines.append(f"- 时间: {ts_human}")
+        md_lines.append(f"- Session: {short_sid}")
+        md_lines.append(f"- Hook event: PostToolUseFailure")
+        outfile.write_text("\n".join(md_lines), encoding="utf-8")
+
+        # --- .ans (colored card, red theme) ---
+        ans = build_error_ans(
+            tool_name=tool_name,
+            tool_input_str=tool_input_str,
+            exit_code=exit_code,
+            stderr=stderr,
+            duration_ms=duration_ms,
+            ts_human=ts_human,
+            fname=outfile.name,
+        )
+        try:
+            outfile.with_suffix(".ans").write_text(ans, encoding="utf-8")
+        except OSError:
+            pass
+
+        # --- .tree (plain ASCII tree) ---
+        try:
+            outfile.with_suffix(".tree").write_text(
+                build_error_tree(
+                    tool_name=tool_name,
+                    tool_input_str=tool_input_str,
+                    exit_code=exit_code,
+                    stderr=stderr,
+                    duration_ms=duration_ms,
+                    ts_human=ts_human,
+                    short_sid=short_sid,
+                    fname=outfile.name,
+                ),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+
+        # Best-effort write to /dev/tty (same as summary path)
+        banner = "\n\033[1;31m╭─ ⚠ Tool Error ─╮\033[0m\n"
+        footer = f"\n\033[2;31m└─ 完整内容：{outfile} ─┘\033[0m\n"
+        try:
+            with open("/dev/tty", "w", encoding="utf-8") as tty:
+                tty.write(banner + ans + footer)
+                tty.flush()
+        except OSError:
+            pass
+
+        # Emit systemMessage for downstream consumers
+        json_payload = {
+            "systemMessage": (
+                f"⚠️ **Tool Error**: `{tool_name}` failed"
+                + (f" (exit {exit_code})" if exit_code is not None else "")
+                + f"\n\n```\n{ans}\n```\n"
+                + f"完整记录: `{outfile}`"
+            )
+        }
+        print(json.dumps(json_payload, ensure_ascii=False))
+        return 0
+    finally:
+        _release_lock(ERROR_LOCK_PATH)
+
+
 def main() -> int:
     hook_input = read_hook_input()
-    tp_str = hook_input.get("transcript_path", "")
     sid = hook_input.get("session_id", "")
+
+    # Dispatch: PostToolUseFailure → error mode (no transcript, no claude -p).
+    # Must come BEFORE the transcript_path check, since error mode doesn't
+    # need the transcript file at all.
+    event = hook_input.get("hook_event_name", "")
+    if event == "PostToolUseFailure":
+        return _handle_error_mode(hook_input, sid)
+
+    tp_str = hook_input.get("transcript_path", "")
     if not tp_str or not Path(tp_str).is_file():
         return 0
 
@@ -532,7 +870,7 @@ def main() -> int:
     if not _try_acquire_lock():
         return 0
     try:
-        latest = _latest_summary_mtime()
+        latest = _latest_mtime("*.md")
         if latest is not None and (time.time() - latest) < DEDUP_SECS:
             return 0
 
@@ -627,6 +965,25 @@ def main() -> int:
         ans_path = outfile.with_suffix(".ans")
         try:
             ans_path.write_text(card, encoding="utf-8")
+        except OSError:
+            pass
+
+        # 1b. Also write a plain-ASCII .tree sidecar — readable in any
+        #     terminal without ANSI support, easy to grep / diff.
+        tree_path = outfile.with_suffix(".tree")
+        try:
+            tree_path.write_text(
+                build_tree_card(
+                    title=title,
+                    summary=summary,
+                    decisions=decisions,
+                    outfile=outfile,
+                    ts_human=ts_human,
+                    short_sid=short_sid,
+                    mode="summary",
+                ),
+                encoding="utf-8",
+            )
         except OSError:
             pass
 

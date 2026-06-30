@@ -92,7 +92,7 @@ def merge_settings(settings: dict, dry_run: bool) -> tuple[dict, list[str]]:
     notes = []
     hooks = settings.setdefault("hooks", {})
 
-    for event in ("SessionEnd", "Stop"):
+    for event in ("SessionEnd", "Stop", "PostToolUseFailure"):
         existing = hooks.get(event, [])
         if hook_entry_already_present(existing, HOOK_COMMAND):
             notes.append(f"  hooks.{event}: already present, skipped")

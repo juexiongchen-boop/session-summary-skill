@@ -47,7 +47,7 @@ def remove_our_hooks(settings: dict) -> tuple[dict, list[str]]:
         return settings, ["  settings.json: no hooks block, nothing to do"]
 
     changed = False
-    for event in ("SessionEnd", "Stop"):
+    for event in ("SessionEnd", "Stop", "PostToolUseFailure"):
         entries = hooks.get(event, [])
         if not entries:
             continue

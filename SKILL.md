@@ -1,13 +1,13 @@
 ---
 name: session-summary-card
-description: "Configure Claude Code to auto-summarize each session into a colored terminal card, persist curated knowledge into memory/ files, and inject a single-line pointer into CLAUDE.md so the next session remembers prior work. Uses an atomic lock file to prevent TOCTOU races between concurrent Stop hooks. Use when the user asks for 'session-end summary', 'daily summary', 'auto-summarize', 'remember past sessions', '跨 session 记忆', 'memory layer', 'atomic lock', 'TOCTOU', or wants a recap card when exiting a session."
-version: 2.0.0
+description: "Configure Claude Code to auto-summarize each session into a colored terminal card + plain-ASCII tree, persist curated knowledge into memory/ files, inject a single-line pointer into CLAUDE.md, and emit a structured error card on tool failures. Uses an atomic lock file to prevent TOCTOU races between concurrent Stop hooks. Use when the user asks for 'session-end summary', 'daily summary', 'auto-summarize', 'remember past sessions', '跨 session 记忆', 'memory layer', 'atomic lock', 'TOCTOU', 'tool error card', '错误卡片', or wants a recap card when exiting a session."
+version: 3.0.0
 license: MIT
 ---
 
-# Session Summary Card (v2 — memory/ + atomic lock)
+# Session Summary Card (v3 — memory/ + atomic lock + error mode + tree format)
 
-Auto-summarize each Claude Code session as a colored ANSI terminal card and **persist the curated knowledge into a three-layer memory architecture** so the next session can recall it without bloating CLAUDE.md.
+Auto-summarize each Claude Code session as a colored ANSI terminal card and **persist the curated knowledge into a three-layer memory architecture** so the next session can recall it without bloating CLAUDE.md. **Detects tool failures in real-time** via the `PostToolUseFailure` hook and emits a structured error card. Outputs both **`.ans`** (colored) and **`.tree`** (plain-ASCII) for any-terminal readability.
 
 ## What you get
 
@@ -15,9 +15,16 @@ After installing, every session with ≥5 user messages produces:
 
 1. **`~/daily-summaries/YYYY-MM-DD-HHMMSS-<sid>.md`** — full structured summary (title, recap, decisions, metadata).
 2. **`~/daily-summaries/YYYY-MM-DD-HHMMSS-<sid>.ans`** — same digest rendered as a colored box-drawing card with ANSI escapes; `cat` it from a truecolor terminal.
-3. **A per-session memory file** at `~/.claude/projects/-root/memory/auto-summary-{ts}-{sid}.md` — frontmatter + curated summary + decisions + links.
-4. **A single-line pointer appended to `~/.claude/CLAUDE.md`** — visible in the next session's context automatically, pointing to the MEMORY.md index.
-5. **The MEMORY.md index** — auto-curated list of all session memory files (max 20 entries).
+3. **`~/daily-summaries/YYYY-MM-DD-HHMMSS-<sid>.tree`** — plain-ASCII tree diagram of the same content (no ANSI needed).
+4. **A per-session memory file** at `~/.claude/projects/-root/memory/auto-summary-{ts}-{sid}.md` — frontmatter + curated summary + decisions + links.
+5. **A single-line pointer appended to `~/.claude/CLAUDE.md`** — visible in the next session's context automatically, pointing to the MEMORY.md index.
+6. **The MEMORY.md index** — auto-curated list of all session memory files (max 20 entries).
+
+When a **tool fails** (any `PostToolUseFailure` hook event), you additionally get:
+
+7. **`~/daily-summaries/ERROR-YYYY-MM-DD-HHMMSS-<sid>.md`** — structured error record (tool name, exit code, curated input with secrets redacted, stderr).
+8. **`~/daily-summaries/ERROR-YYYY-MM-DD-HHMMSS-<sid>.ans`** — red-themed error card.
+9. **`~/daily-summaries/ERROR-YYYY-MM-DD-HHMMSS-<sid>.tree`** — plain-ASCII error tree.
 
 The displayable card never works in the TUI (it tears down at session exit), so persistence-into-memory is the reliable channel.
 
@@ -93,6 +100,40 @@ The v2 design splits responsibility:
 
 CLAUDE.md only carries a pointer line, so context stays small. Memory files are loaded on demand. Daily-summaries are for users who want to grep their history.
 
+### Why three output formats (.md / .ans / .tree)
+
+| Format | Use case |
+|---|---|
+| `.md` | Structured, searchable, source of truth |
+| `.ans` | Color terminal card (truecolor needed) |
+| `.tree` | Plain-ASCII tree — any terminal, easy to grep / diff |
+
+The `.tree` format is the portable fallback when you ssh into a machine without a modern terminal, or want to paste a summary into a chat / ticket without losing structure.
+
+### Error mode (PostToolUseFailure)
+
+When any tool fails (Bash exit ≠ 0, etc.), Claude Code fires `PostToolUseFailure`. The skill catches it and:
+
+1. Acquires a **separate `.error.lock`** (not the summary lock — errors must not block summaries and vice versa).
+2. Applies a separate **60s dedup window** (configurable via `DAILY_SUMMARY_ERROR_DEDUP_SECS`).
+3. **Skips `claude -p` entirely** — the error payload is structured data, no LLM needed. This saves the 110s timeout + API cost.
+4. Curates `tool_input` per tool type (e.g., shows `command` for Bash, `file_path` for Read/Write). Passes the value through `redact_secrets()` to mask API keys, tokens, and passwords before writing to disk.
+5. Writes `ERROR-{ts}-{sid}.{md,ans,tree}` to `~/daily-summaries/`. Errors do **not** propagate to `memory/` — they're transient signals, not durable knowledge.
+
+Example error tree:
+
+```
+session abc12345 — tool error ─ 2026-06-30 12:34:56
+├─ tool: Bash
+│  └─ input: pytest tests/test_x.py  # run tests
+├─ exit_code: 1
+├─ stderr (2 lines):
+│  ├─ AssertionError: expected 42, got 0
+│  └─ at line 17 in test_foo()
+├─ duration_ms: 12340
+└─ ➜ ERROR-2026-06-30-123456-abc12345.md
+```
+
 ### Why an atomic lock (and not just mtime dedup)
 
 The v1 dedup checked `time.time() - latest_mtime < 180s`. This is a TOCTOU race: multiple Stop hooks firing concurrently all read the same old mtime, all judge it as expired, and all run `claude -p` + write new files. Symptom: 1-second-spaced duplicate .md files.
@@ -108,8 +149,9 @@ Set these before running the script (e.g., in `~/.bashrc`):
 | Var | Default | Effect |
 |---|---|---|
 | `DAILY_SUMMARY_MIN_MSG` | `5` | Skip if user messages < N |
-| `DAILY_SUMMARY_DEDUP_SECS` | `180` | Skip if a fresh .md exists |
+| `DAILY_SUMMARY_DEDUP_SECS` | `60` | Summary dedup window (was 180 in v2) |
 | `DAILY_SUMMARY_LOCK_STALE_SECS` | `600` | Break locks older than N seconds |
+| `DAILY_SUMMARY_ERROR_DEDUP_SECS` | `60` | Error-card dedup window |
 | `DAILY_SUMMARY_DIR` | `~/daily-summaries` | Override SUMMARY_DIR (useful for hermetic testing) |
 
 ## Uninstall

@@ -1,6 +1,6 @@
 # session-summary-card
 
-> Auto-summarize every Claude Code session into a colored terminal card, persist curated knowledge into `memory/`, and inject a single-line pointer into `CLAUDE.md` so the next session remembers what happened.
+> Auto-summarize every Claude Code session into a colored terminal card + plain-ASCII tree, persist curated knowledge into `memory/`, and inject a single-line pointer into `CLAUDE.md` so the next session remembers what happened. v3 also catches tool errors in real-time via PostToolUseFailure.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
@@ -50,6 +50,34 @@ When the hook fires, you get a colored card (best viewed with `cat` or `less -R`
 ```
 
 (The TUI won't show this — it tears down before render. The `.ans` file is preserved on disk.)
+
+Same content, plain-ASCII `.tree` (no ANSI, works in any terminal):
+
+```
+session abc12345 — auto-summary ─ 2026-06-30 12:34:56
+├─ 主题: Refactor dedup to use atomic lock file
+├─ 摘要: User wanted to eliminate TOCTOU race…
+├─ 决策 / 待办 (4):
+│  ├─ Added _try_acquire_lock with O_EXCL
+│  ├─ Stress test passes 10/20 concurrent
+│  ├─ Stop hook now writes to memory/
+│  └─ CLAUDE.md reduced to single pointer
+└─ ➜ 2026-06-30-123456-abc12345.md
+```
+
+When a tool fails, you get a **red-themed error card** + `.tree`:
+
+```
+session abc12345 — tool error ─ 2026-06-30 12:34:56
+├─ tool: Bash
+│  └─ input: pytest tests/test_x.py  # run tests
+├─ exit_code: 1
+├─ stderr (2 lines):
+│  ├─ AssertionError: expected 42, got 0
+│  └─ at line 17 in test_foo()
+├─ duration_ms: 12340
+└─ ➜ ERROR-2026-06-30-123456-abc12345.md
+```
 
 ## Three install paths
 
@@ -105,8 +133,9 @@ Read [SKILL.md](SKILL.md) for the full design rationale, configuration env vars,
 | Env var | Default | What |
 |---|---|---|
 | `DAILY_SUMMARY_MIN_MSG` | `5` | Skip if user messages < N |
-| `DAILY_SUMMARY_DEDUP_SECS` | `180` | Skip if a fresh .md exists |
+| `DAILY_SUMMARY_DEDUP_SECS` | `60` | Summary dedup window (was 180 in v2) |
 | `DAILY_SUMMARY_LOCK_STALE_SECS` | `600` | Break locks older than N seconds |
+| `DAILY_SUMMARY_ERROR_DEDUP_SECS` | `60` | Error-card dedup window |
 | `DAILY_SUMMARY_DIR` | `~/daily-summaries` | Override SUMMARY_DIR (for hermetic testing) |
 
 ## License
