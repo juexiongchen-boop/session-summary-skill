@@ -79,10 +79,22 @@ def load_settings(home: Path) -> dict:
 
 
 def hook_entry_already_present(hooks_list: list, command: str) -> bool:
-    """True if any entry in hooks_list already runs the given command."""
+    """True if any entry already runs daily-summary.py.
+
+    Matches by EITHER exact command string OR by script basename, so:
+      - `python3 /root/.claude/scripts/daily-summary.py`
+      - `python3 ~/.claude/scripts/daily-summary.py`
+      - `python /home/foo/.claude/scripts/daily-summary.py`
+    all collapse to the same "already installed" entry. Prevents duplicates
+    when the user previously installed with a different path form.
+    """
+    target_name = Path(command).name
     for entry in hooks_list:
         for sub in entry.get("hooks", []):
-            if sub.get("command") == command:
+            existing_cmd = sub.get("command", "")
+            if existing_cmd == command:
+                return True
+            if Path(existing_cmd).name == target_name:
                 return True
     return False
 
